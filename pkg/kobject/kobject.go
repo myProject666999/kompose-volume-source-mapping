@@ -169,9 +169,13 @@ type ServiceConfig struct {
 	CronJobConcurrencyPolicy batchv1.ConcurrencyPolicy `compose:"kompose.cronjob.concurrency_policy"`
 	CronJobBackoffLimit      *int32                    `compose:"kompose.cronjob.backoff_limit"`
 	Volumes                  []Volumes                 `compose:""`
-	Secrets                  []types.ServiceSecretConfig
-	HealthChecks             HealthChecks `compose:""`
-	Placement                Placement    `compose:""`
+	// VolumeTypes records the compose-declared type ("volume", "bind", ...) of each
+	// entry in VolList, keyed by the reconstructed source:target[:ro] string, so the
+	// type information survives loading instead of being guessed from the path shape.
+	VolumeTypes  map[string]string `compose:""`
+	Secrets      []types.ServiceSecretConfig
+	HealthChecks HealthChecks `compose:""`
+	Placement    Placement    `compose:""`
 	//This is for long LONG SYNTAX link(https://docs.docker.com/compose/compose-file/#long-syntax)
 	Configs []types.ServiceConfigObjConfig `compose:""`
 	//This is for SHORT SYNTAX link(https://docs.docker.com/compose/compose-file/#configs)
@@ -233,6 +237,9 @@ type Volumes struct {
 	PVCName       string // name of PVC
 	PVCSize       string // PVC size
 	SelectorValue string // Value of the label selector
+	Type          string // compose-declared volume type: "volume" (named), "bind" (host path) or "" if unknown
+	AccessMode    string // PVC access mode requested via the kompose.volume.access-mode label (rwo/rox/rwx/rwop)
+	External      bool   // volume is declared external: true in the compose file; reference an existing PVC instead of creating one
 }
 
 // Placement holds the placement struct of container

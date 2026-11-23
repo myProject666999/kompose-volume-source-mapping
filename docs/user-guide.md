@@ -138,6 +138,8 @@ Labels are an important kompose concept as they allow you to add Kubernetes modi
 | `String` | `nodeport`, `clusterip`, `loadbalancer`, `headless` |
 | [`kompose.volume.size`](#komposevolumesize) | Size of the volume |
 | `String` | `1Gi` |
+| [`kompose.volume.access-mode`](#komposevolumeaccess-mode) | Access mode of the generated PersistentVolumeClaim |
+| `String` | `rwo`, `rox`, `rwx`, `rwop` |
 | [`kompose.volume.storage-class-name`](#komposevolumestorage-class-name) | StorageClassName for provisioning volumes |
 | `String` | `standard` |
 | [`kompose.volume.subpath`](#komposevolumesubpath) | Subpath inside the mounted volume |
@@ -529,6 +531,39 @@ services:
       - db-data:/var/lib/postgresql/data
 ```
 
+The size of a generated PersistentVolumeClaim comes from three sources, in
+decreasing priority: the `kompose.volume.size` label on the root-level volume
+definition, the `--pvc-request-size` command line option, and the built-in
+default (`100Mi`). Values must be valid Kubernetes quantities (e.g. `1Gi`,
+`512Mi`, `1G`); surrounding whitespace is ignored, but an invalid value such as
+`1gi` fails the conversion with an error naming the volume and the service.
+
+### kompose.volume.access-mode
+
+The label is set on the root-level volume definition and controls the access
+mode of the generated PersistentVolumeClaim, independently of whether the
+mount is read-only inside the container:
+
+```yaml
+services:
+  db:
+    image: postgres:10.1
+    volumes:
+      - db-data:/var/lib/postgresql/data
+volumes:
+  db-data:
+    labels:
+      kompose.volume.access-mode: rwx
+```
+
+Accepted values are `rwo` (ReadWriteOnce), `rox` (ReadOnlyMany), `rwx`
+(ReadWriteMany) and `rwop` (ReadWriteOncePod); any other value fails the
+conversion with an error naming the volume. Without the label, the legacy
+behavior is kept for compatibility: a `:ro` suffix on the volume makes the
+whole PVC `ReadOnlyMany` (with a warning, since many storage classes cannot
+bind such claims), otherwise the PVC is `ReadWriteOnce`. The `:ro` suffix
+always only controls `readOnly` on the container volume mount.
+
 ### kompose.volume.storage-class-name
 
 ```yaml
@@ -562,6 +597,27 @@ services:
     volumes:
       - db-data:/var/lib/postgresql/data
 ```
+
+Without any label or `--volumes` option, each volume lands on the type
+declared in the compose file: named volumes become PersistentVolumeClaims,
+bind mounts become `hostPath` volumes (relative sources are resolved against
+the compose file directory), and `tmpfs` mounts become `emptyDir` volumes with
+`medium: Memory` (a tmpfs `size` becomes the emptyDir `sizeLimit`, using
+binary units, e.g. `64m` is 64MiB; tmpfs `mode` has no Kubernetes equivalent
+and is reported in a warning). A bind mount of a single existing file keeps
+being converted to a ConfigMap. Volumes declared `external: true` in the
+compose file reference a pre-existing PVC (the `name:` if set) and no PVC is
+generated.
+
+The `--volumes` global option forces **all** volumes to the requested type —
+including bind mounts, so `--volumes emptyDir` on a bind mount means the host
+directory contents will *not* appear in the pod (kompose prints a warning in
+that case). The `kompose.volume.type` label overrides the global option for
+its service.
+
+**Known limitation**: the label applies to the whole service, so a service
+mixing named volumes and bind mounts can only force a single type for all of
+them.
 
 ## Restart Policy
 

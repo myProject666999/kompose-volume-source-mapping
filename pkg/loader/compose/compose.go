@@ -256,9 +256,22 @@ func convertDockerLabel(dockerLabel string) (string, error) {
 // TODO: Check to see if it's a "bind" or "volume". Ignore for now.
 // TODO: Refactor it similar to loadPorts
 // See: https://docs.docker.com/compose/compose-file/#long-syntax-3
-func loadVolumes(volumes []types.ServiceVolumeConfig) []string {
-	var volArray []string
+// loadVolumes converts compose service volumes back to the source:target[:ro]
+// string form consumed by ParseVols. The compose-declared type of each entry
+// ("volume", "bind", ...) is returned in a map keyed by that same string so the
+// type information is not lost. Long-syntax tmpfs mounts have no source and are
+// returned separately, encoded as "target[:size=<bytes>][,mode=<octal>]" so they
+// can be routed to the tmpfs (emptyDir Memory) handling instead of ParseVols.
+func loadVolumes(volumes []types.ServiceVolumeConfig) (volArray []string, tmpfsArray []string, volTypes map[string]string) {
+	volTypes = map[string]string{}
 	for _, vol := range volumes {
+		// Long-syntax tmpfs mounts are declared under volumes with type "tmpfs";
+		// they carry no source and must not go through source:target parsing.
+		if vol.Type == types.VolumeTypeTmpfs {
+			tmpfsArray = append(tmpfsArray, encodeTmpfsVolume(vol))
+			continue
+		}
+
 		// There will *always* be Source when parsing
 		v := vol.Source
 
@@ -271,8 +284,30 @@ func loadVolumes(volumes []types.ServiceVolumeConfig) []string {
 		}
 
 		volArray = append(volArray, v)
+		volTypes[v] = vol.Type
 	}
-	return volArray
+	return volArray, tmpfsArray, volTypes
+}
+
+// encodeTmpfsVolume renders a long-syntax tmpfs volume as
+// "target[:size=<bytes>][,mode=<octal>]", matching the option form understood
+// for the tmpfs list key (e.g. "/run:size=64m,mode=1777").
+func encodeTmpfsVolume(vol types.ServiceVolumeConfig) string {
+	v := vol.Target
+	if vol.Tmpfs == nil {
+		return v
+	}
+	var opts []string
+	if vol.Tmpfs.Size > 0 {
+		opts = append(opts, fmt.Sprintf("size=%d", int64(vol.Tmpfs.Size)))
+	}
+	if vol.Tmpfs.Mode != 0 {
+		opts = append(opts, fmt.Sprintf("mode=%o", vol.Tmpfs.Mode))
+	}
+	if len(opts) > 0 {
+		v = v + ":" + strings.Join(opts, ",")
+	}
+	return v
 }
 
 // Convert Compose ports to kobject.Ports
@@ -582,7 +617,11 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 		// Parse the volumes
 		// Again, in v3, we use the "long syntax" for volumes in terms of parsing
 		// https://docs.docker.com/compose/compose-file/#long-syntax-3
-		serviceConfig.VolList = loadVolumes(composeServiceConfig.Volumes)
+		var tmpfsVols []string
+		var volTypes map[string]string
+		serviceConfig.VolList, tmpfsVols, volTypes = loadVolumes(composeServiceConfig.Volumes)
+		serviceConfig.TmpFs = append(serviceConfig.TmpFs, tmpfsVols...)
+		serviceConfig.VolumeTypes = volTypes
 		if err := parseKomposeLabels(composeServiceConfig.Labels, &serviceConfig); err != nil {
 			return kobject.KomposeObject{}, err
 		}
@@ -832,6 +871,7 @@ func parseKomposeLabels(labels map[string]string, serviceConfig *kobject.Service
 }
 
 func handleVolume(komposeObject *kobject.KomposeObject, volumes *types.Volumes) {
+	driverWarned := map[string]bool{}
 	for name := range komposeObject.ServiceConfigs {
 		// retrieve volumes of service
 		vols, err := retrieveVolume(name, *komposeObject)
@@ -839,12 +879,24 @@ func handleVolume(komposeObject *kobject.KomposeObject, volumes *types.Volumes) 
 			errors.Wrap(err, "could not retrieve vvolume")
 		}
 		for volName, vol := range vols {
-			size, selector := getVolumeLabels(vol.VolumeName, volumes)
-			if len(size) > 0 || len(selector) > 0 {
+			size, selector, accessMode := getVolumeLabels(vol.VolumeName, volumes)
+			external, externalName := getVolumeExternal(vol.VolumeName, volumes)
+			if !driverWarned[vol.VolumeName] {
+				warnUnsupportedVolumeDriver(vol.VolumeName, volumes)
+				driverWarned[vol.VolumeName] = true
+			}
+			if len(size) > 0 || len(selector) > 0 || len(accessMode) > 0 || external {
 				// We can't assign value to struct field in map while iterating over it, so temporary variable `temp` is used here
 				var temp = vols[volName]
 				temp.PVCSize = size
 				temp.SelectorValue = selector
+				temp.AccessMode = accessMode
+				if external {
+					temp.External = true
+					if externalName != "" {
+						temp.VolumeName = externalName
+					}
+				}
 				vols[volName] = temp
 			}
 		}
@@ -867,7 +919,7 @@ func retrieveVolume(svcName string, komposeObject kobject.KomposeObject) (volume
 				return nil, errors.Wrapf(err, "could not retrieve the volume")
 			}
 			var cVols []kobject.Volumes
-			cVols, err = ParseVols(komposeObject.ServiceConfigs[svcName].VolList, svcName)
+			cVols, err = ParseVols(komposeObject.ServiceConfigs[svcName].VolList, svcName, komposeObject.ServiceConfigs[svcName].VolumeTypes)
 			if err != nil {
 				return nil, errors.Wrapf(err, "error generating current volumes")
 			}
@@ -900,7 +952,7 @@ func retrieveVolume(svcName string, komposeObject kobject.KomposeObject) (volume
 		}
 	} else {
 		// if `volumes-from` is not present
-		volume, err = ParseVols(komposeObject.ServiceConfigs[svcName].VolList, svcName)
+		volume, err = ParseVols(komposeObject.ServiceConfigs[svcName].VolList, svcName, komposeObject.ServiceConfigs[svcName].VolumeTypes)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error generating current volumes")
 		}
@@ -918,8 +970,10 @@ func checkVolDependent(dv kobject.Volumes, volume []kobject.Volumes) bool {
 	return true
 }
 
-// ParseVols parse volumes
-func ParseVols(volNames []string, svcName string) ([]kobject.Volumes, error) {
+// ParseVols parse volumes. The optional volTypes argument maps each raw volume
+// string to the type declared in the compose file ("volume", "bind", ...); when
+// omitted, the type stays empty and callers fall back to guessing from the path.
+func ParseVols(volNames []string, svcName string, volTypes ...map[string]string) ([]kobject.Volumes, error) {
 	var volumes []kobject.Volumes
 	var err error
 
@@ -930,6 +984,9 @@ func ParseVols(volNames []string, svcName string) ([]kobject.Volumes, error) {
 			return nil, errors.Wrapf(err, "could not parse volume %q: %v", vn, err)
 		}
 		v.VolumeName = normalizeVolumes(v.VolumeName)
+		if len(volTypes) > 0 && volTypes[0] != nil {
+			v.Type = volTypes[0][vn]
+		}
 		v.SvcName = svcName
 		v.MountPath = fmt.Sprintf("%s:%s", v.Host, v.Container)
 		v.PVCName = fmt.Sprintf("%s-claim%d", v.SvcName, i)
@@ -949,8 +1006,8 @@ func getVol(toFind kobject.Volumes, Vols []kobject.Volumes) (bool, kobject.Volum
 	return false, kobject.Volumes{}
 }
 
-func getVolumeLabels(name string, volumes *types.Volumes) (string, string) {
-	size, selector := "", ""
+func getVolumeLabels(name string, volumes *types.Volumes) (string, string, string) {
+	size, selector, accessMode := "", "", ""
 
 	if volume, ok := (*volumes)[name]; ok {
 		for key, value := range volume.Labels {
@@ -958,11 +1015,41 @@ func getVolumeLabels(name string, volumes *types.Volumes) (string, string) {
 				size = value
 			} else if key == "kompose.volume.selector" {
 				selector = value
+			} else if key == "kompose.volume.access-mode" {
+				accessMode = value
 			}
 		}
 	}
 
-	return size, selector
+	return size, selector, accessMode
+}
+
+// getVolumeExternal reports whether the named root-level volume is declared
+// external: true, and the name of the pre-existing volume it refers to
+// (the explicit `name:` if set, otherwise the compose key).
+func getVolumeExternal(name string, volumes *types.Volumes) (bool, string) {
+	if volume, ok := (*volumes)[name]; ok && bool(volume.External) {
+		if volume.Name != "" {
+			return true, normalizeVolumes(volume.Name)
+		}
+		return true, ""
+	}
+	return false, ""
+}
+
+// warnUnsupportedVolumeDriver reports root-level volume keys that have no
+// Kubernetes counterpart (driver, driver_opts), naming the volume involved.
+func warnUnsupportedVolumeDriver(name string, volumes *types.Volumes) {
+	volume, ok := (*volumes)[name]
+	if !ok {
+		return
+	}
+	if volume.Driver != "" {
+		log.Warnf("Volume %s: 'driver' is not supported - ignoring driver %q", name, volume.Driver)
+	}
+	if len(volume.DriverOpts) > 0 {
+		log.Warnf("Volume %s: 'driver_opts' is not supported - ignoring driver options", name)
+	}
 }
 
 // getGroupAdd will return group in int64 format

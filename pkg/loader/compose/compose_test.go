@@ -19,6 +19,7 @@ package compose
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -200,11 +201,187 @@ func TestLoadV3Volumes(t *testing.T) {
 		ReadOnly: true,
 	}
 	volumes := []types.ServiceVolumeConfig{vol}
-	output := loadVolumes(volumes)
+	output, tmpfs, volTypes := loadVolumes(volumes)
 	expected := "/tmp/foobar:/tmp/foobar:ro"
 
 	if output[0] != expected {
 		t.Errorf("Expected %s, got %s", expected, output[0])
+	}
+	if len(tmpfs) != 0 {
+		t.Errorf("Expected no tmpfs volumes, got %v", tmpfs)
+	}
+	if volTypes[expected] != "volume" {
+		t.Errorf("Expected volume type to be preserved, got %q", volTypes[expected])
+	}
+}
+
+// Long-syntax tmpfs mounts under volumes: are routed to the tmpfs list with
+// their size (bytes) and mode (octal) encoded, not to source:target parsing.
+func TestLoadV3VolumesTmpfs(t *testing.T) {
+	volumes := []types.ServiceVolumeConfig{
+		{
+			Type:   types.VolumeTypeTmpfs,
+			Target: "/run",
+			Tmpfs:  &types.ServiceVolumeTmpfs{Size: 67108864, Mode: 0o1777},
+		},
+		{
+			Type:   types.VolumeTypeTmpfs,
+			Target: "/cache",
+		},
+	}
+	vols, tmpfs, _ := loadVolumes(volumes)
+	if len(vols) != 0 {
+		t.Errorf("Expected no regular volumes, got %v", vols)
+	}
+	if len(tmpfs) != 2 {
+		t.Fatalf("Expected 2 tmpfs entries, got %v", tmpfs)
+	}
+	if tmpfs[0] != "/run:size=67108864,mode=1777" {
+		t.Errorf("Unexpected tmpfs encoding: %s", tmpfs[0])
+	}
+	if tmpfs[1] != "/cache" {
+		t.Errorf("Unexpected tmpfs encoding: %s", tmpfs[1])
+	}
+}
+
+// ParseVols propagates the compose-declared volume type when provided.
+func TestParseVolsWithTypes(t *testing.T) {
+	volNames := []string{"dbdata:/var/lib/mysql", "./conf:/etc/app"}
+	volTypes := map[string]string{
+		"dbdata:/var/lib/mysql": "volume",
+		"./conf:/etc/app":       "bind",
+	}
+	vols, err := ParseVols(volNames, "app", volTypes)
+	if err != nil {
+		t.Fatalf("ParseVols failed: %v", err)
+	}
+	if vols[0].Type != "volume" || vols[1].Type != "bind" {
+		t.Errorf("Expected types to be propagated, got %q and %q", vols[0].Type, vols[1].Type)
+	}
+
+	// without type information the field stays empty (legacy behavior)
+	vols, err = ParseVols(volNames, "app")
+	if err != nil {
+		t.Fatalf("ParseVols failed: %v", err)
+	}
+	if vols[0].Type != "" || vols[1].Type != "" {
+		t.Errorf("Expected empty types without a type map, got %q and %q", vols[0].Type, vols[1].Type)
+	}
+}
+
+// Loading a compose file preserves the declared volume types, and root-level
+// volume labels/external declarations land on the kobject volumes.
+func TestLoadComposeVolumeTypesAndExternal(t *testing.T) {
+	dir := t.TempDir()
+	composeFile := `
+services:
+  app:
+    image: nginx
+    volumes:
+      - dbdata:/var/lib/mysql
+      - ./conf:/etc/app
+volumes:
+  dbdata:
+    labels:
+      kompose.volume.size: 2Gi
+      kompose.volume.access-mode: rwx
+  extvol:
+    external: true
+    name: real-pvc
+`
+	path := filepath.Join(dir, "docker-compose.yaml")
+	if err := os.WriteFile(path, []byte(composeFile), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c := Compose{}
+	ko, err := c.LoadFile([]string{path}, nil, false)
+	if err != nil {
+		t.Fatalf("LoadFile failed: %v", err)
+	}
+	svc := ko.ServiceConfigs["app"]
+	if svc.VolumeTypes["dbdata:/var/lib/mysql"] != "volume" {
+		t.Errorf("Expected named volume type to be preserved, got %q", svc.VolumeTypes["dbdata:/var/lib/mysql"])
+	}
+	// compose-go resolves relative bind paths against the compose file dir at
+	// load time, so the type map is keyed by the absolute path
+	bindKey := filepath.Join(dir, "conf") + ":/etc/app"
+	if svc.VolumeTypes[bindKey] != "bind" {
+		t.Errorf("Expected bind mount type to be preserved, got %q (map: %v)", svc.VolumeTypes[bindKey], svc.VolumeTypes)
+	}
+	var dbdata *kobject.Volumes
+	for i := range svc.Volumes {
+		if svc.Volumes[i].VolumeName == "dbdata" {
+			dbdata = &svc.Volumes[i]
+		}
+	}
+	if dbdata == nil {
+		t.Fatalf("dbdata volume not found in %+v", svc.Volumes)
+	}
+	if dbdata.Type != "volume" || dbdata.PVCSize != "2Gi" || dbdata.AccessMode != "rwx" {
+		t.Errorf("Unexpected dbdata volume: %+v", dbdata)
+	}
+}
+
+// A windows-style bind source survives the long-syntax round trip:
+// loadVolumes rebuilds the source:target[:ro] string and ParseVols (via
+// transformer.ParseVolume's windows branch) splits it back correctly.
+func TestLoadV3VolumesWindowsBindRoundTrip(t *testing.T) {
+	volumes := []types.ServiceVolumeConfig{
+		{
+			Type:     types.VolumeTypeBind,
+			Source:   `C:\Users\Data`,
+			Target:   "/etc/config",
+			ReadOnly: true,
+		},
+	}
+	volArray, _, volTypes := loadVolumes(volumes)
+	vols, err := ParseVols(volArray, "app", volTypes)
+	if err != nil {
+		t.Fatalf("ParseVols failed: %v", err)
+	}
+	if len(vols) != 1 {
+		t.Fatalf("Expected 1 volume, got %+v", vols)
+	}
+	if vols[0].Host != `C:\Users\Data` || vols[0].Container != "/etc/config" || vols[0].Mode != "ro" {
+		t.Errorf("Unexpected windows volume round trip: %+v", vols[0])
+	}
+	if vols[0].Type != "bind" {
+		t.Errorf("Expected bind type to be preserved, got %q", vols[0].Type)
+	}
+}
+
+// An external root-level volume is flagged and resolved to its external name.
+func TestLoadComposeExternalVolume(t *testing.T) {
+	dir := t.TempDir()
+	composeFile := `
+services:
+  app:
+    image: nginx
+    volumes:
+      - extvol:/data
+volumes:
+  extvol:
+    external: true
+    name: real-pvc
+`
+	path := filepath.Join(dir, "docker-compose.yaml")
+	if err := os.WriteFile(path, []byte(composeFile), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c := Compose{}
+	ko, err := c.LoadFile([]string{path}, nil, false)
+	if err != nil {
+		t.Fatalf("LoadFile failed: %v", err)
+	}
+	vols := ko.ServiceConfigs["app"].Volumes
+	if len(vols) != 1 {
+		t.Fatalf("Expected 1 volume, got %+v", vols)
+	}
+	if !vols[0].External {
+		t.Errorf("Expected volume to be marked external: %+v", vols[0])
+	}
+	if vols[0].VolumeName != "real-pvc" {
+		t.Errorf("Expected external name real-pvc, got %q", vols[0].VolumeName)
 	}
 }
 

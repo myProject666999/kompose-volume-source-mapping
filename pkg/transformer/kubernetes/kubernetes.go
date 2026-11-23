@@ -656,9 +656,9 @@ func (k *Kubernetes) CreateSecrets(komposeObject kobject.KomposeObject) ([]*api.
 
 // CreatePVC initializes PersistentVolumeClaim
 func (k *Kubernetes) CreatePVC(name string, mode string, size string, selectorValue string, storageClassName string) (*api.PersistentVolumeClaim, error) {
-	volSize, err := resource.ParseQuantity(size)
+	volSize, err := resource.ParseQuantity(strings.TrimSpace(size))
 	if err != nil {
-		return nil, errors.Wrap(err, "resource.ParseQuantity failed, Error parsing size")
+		return nil, errors.Wrapf(err, "resource.ParseQuantity failed, Error parsing size %q", size)
 	}
 
 	pvc := &api.PersistentVolumeClaim{
@@ -818,16 +818,19 @@ func (k *Kubernetes) ConfigTmpfs(name string, service kobject.ServiceConfig) ([]
 	for index, volume := range service.TmpFs {
 		//naming volumes if multiple tmpfs are provided
 		volumeName := fmt.Sprintf("%s-tmpfs%d", name, index)
-		volume = strings.Split(volume, ":")[0]
+		mountPath, sizeLimit := parseTmpfsOptions(name, volume)
 		// create a new volume mount object and append to list
 		volMount := api.VolumeMount{
 			Name:      volumeName,
-			MountPath: volume,
+			MountPath: mountPath,
 		}
 		volumeMounts = append(volumeMounts, volMount)
 
 		//create tmpfs specific empty volumes
 		volSource := k.ConfigEmptyVolumeSource("tmpfs")
+		if sizeLimit != nil {
+			volSource.EmptyDir.SizeLimit = sizeLimit
+		}
 
 		// create a new volume object using the volsource and add to list
 		vol := api.Volume{
@@ -837,6 +840,77 @@ func (k *Kubernetes) ConfigTmpfs(name string, service kobject.ServiceConfig) ([]
 		volumes = append(volumes, vol)
 	}
 	return volumeMounts, volumes
+}
+
+// parseTmpfsOptions splits a tmpfs entry into its mount path and an optional
+// emptyDir size limit. Entries are either a plain path ("/run") or carry
+// options after a colon ("/run:size=64m,mode=1777"). Sizes follow the compose
+// convention: a plain number is a byte count (long syntax tmpfs.size), and the
+// k/m/g suffixes are binary (64m == 64MiB). The mode option has no kubernetes
+// equivalent and only produces a warning.
+func parseTmpfsOptions(serviceName string, entry string) (mountPath string, sizeLimit *resource.Quantity) {
+	parts := strings.SplitN(entry, ":", 2)
+	mountPath = parts[0]
+	if len(parts) == 1 {
+		return mountPath, nil
+	}
+	for _, opt := range strings.Split(parts[1], ",") {
+		kv := strings.SplitN(strings.TrimSpace(opt), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch strings.ToLower(kv[0]) {
+		case "size":
+			if q, err := parseTmpfsSize(kv[1]); err != nil {
+				log.Warnf("Service %s: unable to parse tmpfs size %q - ignoring size limit", serviceName, kv[1])
+			} else {
+				sizeLimit = q
+			}
+		case "mode":
+			log.Warnf("Service %s: tmpfs mode %q is not supported by kubernetes emptyDir - ignoring", serviceName, kv[1])
+		}
+	}
+	return mountPath, sizeLimit
+}
+
+// parseTmpfsSize parses a tmpfs size into a resource.Quantity. A bare number is
+// a byte count; the suffixes k, m and g (optionally followed by b, case
+// insensitive) are binary multipliers, matching the compose/docker convention.
+func parseTmpfsSize(s string) (*resource.Quantity, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, fmt.Errorf("empty tmpfs size")
+	}
+	multiplier := int64(1)
+	num := s
+	last := s[len(s)-1]
+	if last == 'b' || last == 'B' {
+		num = s[:len(s)-1]
+		if num == "" {
+			return nil, fmt.Errorf("invalid tmpfs size %q", s)
+		}
+		last = num[len(num)-1]
+	}
+	switch last {
+	case 'k', 'K':
+		multiplier = 1 << 10
+		num = num[:len(num)-1]
+	case 'm', 'M':
+		multiplier = 1 << 20
+		num = num[:len(num)-1]
+	case 'g', 'G':
+		multiplier = 1 << 30
+		num = num[:len(num)-1]
+	}
+	if num == "" {
+		return nil, fmt.Errorf("invalid tmpfs size %q", s)
+	}
+	value, err := strconv.ParseInt(num, 10, 64)
+	if err != nil {
+		return nil, errors.Wrapf(err, "invalid tmpfs size %q", s)
+	}
+	q := resource.NewQuantity(value*multiplier, resource.BinarySI)
+	return q, nil
 }
 
 // ConfigSecretVolumes config volumes from secret.
@@ -975,13 +1049,18 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 	var volumeName string
 	var subpathName string
 
-	// Set a var based on if the user wants to use empty volumes
-	// as opposed to persistent volumes and volume claims
-	useEmptyVolumes := k.Opt.EmptyVols
-	useHostPath := k.Opt.Volumes == "hostPath"
-	useConfigMap := k.Opt.Volumes == "configMap"
-	if k.Opt.Volumes == "emptyDir" {
-		useEmptyVolumes = true
+	// The volume type may be forced for the whole service, either by the global
+	// --volumes option (emptyDir/hostPath/configMap) or, with higher priority, by
+	// the per-service kompose.volume.type label. "persistentVolumeClaim" (the
+	// default) is not a real override: it means each volume lands on its natural
+	// type (named volume -> PVC, bind mount -> hostPath).
+	forcedType := ""
+	if k.Opt.EmptyVols || k.Opt.Volumes == "emptyDir" {
+		forcedType = "emptyDir"
+	} else if k.Opt.Volumes == "hostPath" {
+		forcedType = "hostPath"
+	} else if k.Opt.Volumes == "configMap" {
+		forcedType = "configMap"
 	}
 
 	if subpath, ok := service.Labels["kompose.volume.subpath"]; ok {
@@ -993,9 +1072,7 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 		if _, okk := ValidVolumeSet[vt]; !okk {
 			return nil, nil, nil, nil, fmt.Errorf("invalid volume type %s specified in label 'kompose.volume.type' in service %s", vt, service.Name)
 		}
-		useEmptyVolumes = vt == "emptyDir"
-		useHostPath = vt == "hostPath"
-		useConfigMap = vt == "configMap"
+		forcedType = vt
 	}
 
 	// config volumes from secret if present
@@ -1005,6 +1082,7 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 
 	var count int
 	skip := false
+	useConfigMap := false
 	//iterating over array of `Vols` struct as it contains all necessary information about volumes
 	for _, volume := range service.Volumes {
 		// check if ro/rw mode is defined, default rw
@@ -1017,17 +1095,41 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 		// not used asigned readonly because dont break e2e
 		useConfigMap, _, skip = isConfigFile(mountHost)
 		if skip {
-			log.Warnf("Skip file in path %s ", volume.Host)
+			log.Warnf("Skip file in path %s for service %s", volume.Host, name)
 			continue
 		}
-		if volume.VolumeName == "" {
-			if useEmptyVolumes {
-				volumeName = strings.Replace(volume.PVCName, "claim", "empty", 1)
-			} else if useHostPath {
-				volumeName = strings.Replace(volume.PVCName, "claim", "hostpath", 1)
-			} else if useConfigMap {
-				volumeName = strings.Replace(volume.PVCName, "claim", "cm", 1)
+
+		// Resolve the kubernetes volume type for this volume: forced type first
+		// (label > global option), then the configMap auto-detection for existing
+		// host files, then the natural landing spot of the compose-declared type.
+		vtype := forcedType
+		if vtype == "" {
+			if useConfigMap {
+				vtype = "configMap"
 			} else {
+				vtype = naturalVolumeType(volume)
+			}
+		}
+
+		// An external volume always references a pre-existing PVC, regardless of
+		// any forced type, and never generates a PVC object.
+		if volume.External {
+			vtype = "external"
+		}
+
+		if vtype == "emptyDir" && (volume.Type == "bind" || volume.Host != "") {
+			log.Warnf("Volume %s in service %s is a bind mount but is converted to emptyDir: the host directory contents will NOT be visible inside the pod", volume.MountPath, name)
+		}
+
+		if volume.VolumeName == "" {
+			switch vtype {
+			case "emptyDir":
+				volumeName = strings.Replace(volume.PVCName, "claim", "empty", 1)
+			case "hostPath":
+				volumeName = strings.Replace(volume.PVCName, "claim", "hostpath", 1)
+			case "configMap":
+				volumeName = strings.Replace(volume.PVCName, "claim", "cm", 1)
+			default:
 				volumeName = volume.PVCName
 			}
 			// to support service group bases on volume, we need use the new group name to replace the origin service name
@@ -1047,15 +1149,16 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 		// For PVC we will also create a PVC object and add to list
 		var volsource *api.VolumeSource
 
-		if useEmptyVolumes {
+		switch vtype {
+		case "emptyDir":
 			volsource = k.ConfigEmptyVolumeSource("volume")
-		} else if useHostPath {
+		case "hostPath":
 			source, err := k.ConfigHostPathVolumeSource(volume.Host)
 			if err != nil {
 				return nil, nil, nil, nil, errors.Wrap(err, "k.ConfigHostPathVolumeSource failed")
 			}
 			volsource = source
-		} else if useConfigMap {
+		case "configMap":
 			log.Debugf("Use configmap volume")
 			cm, err := k.IntiConfigMapFromFileOrDir(name, volumeName, volume.Host, service)
 			if err != nil {
@@ -1067,7 +1170,10 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 			if useSubPathMount(cm) {
 				volMount.SubPath = volsource.ConfigMap.Items[0].Path
 			}
-		} else {
+		case "external":
+			log.Infof("Volume %s in service %s is declared external: referencing the existing PVC %q, no PersistentVolumeClaim will be generated", volume.VolumeName, name, volumeName)
+			volsource = k.ConfigPVCVolumeSource(volumeName, readonly)
+		default:
 			volsource = k.ConfigPVCVolumeSource(volumeName, readonly)
 			if volume.VFrom == "" {
 				var storageClassName string
@@ -1087,10 +1193,15 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 					}
 				}
 
-				createdPVC, err := k.CreatePVC(volumeName, volume.Mode, defaultSize, volume.SelectorValue, storageClassName)
+				mode, err := resolveAccessMode(volume, name)
+				if err != nil {
+					return nil, nil, nil, nil, err
+				}
+
+				createdPVC, err := k.CreatePVC(volumeName, mode, defaultSize, volume.SelectorValue, storageClassName)
 
 				if err != nil {
-					return nil, nil, nil, nil, errors.Wrap(err, "k.CreatePVC failed")
+					return nil, nil, nil, nil, errors.Wrapf(err, "k.CreatePVC failed for volume %s in service %s", volumeName, name)
 				}
 
 				PVCs = append(PVCs, createdPVC)
@@ -1108,12 +1219,45 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 		}
 		volumes = append(volumes, vol)
 
-		if len(volume.Host) > 0 && (!useHostPath && !useConfigMap) {
+		if len(volume.Host) > 0 && vtype == "persistentVolumeClaim" {
 			log.Warningf("Volume mount on the host %q isn't supported - ignoring path on the host", volume.Host)
 		}
 	}
 
 	return volumeMounts, volumes, PVCs, cms, nil
+}
+
+// naturalVolumeType maps a compose-declared volume type to its natural
+// kubernetes counterpart: bind mounts become hostPath, named volumes become
+// PVCs. When the type is unknown (e.g. the volume was not loaded from a
+// compose file) the presence of a host path is used as the bind-mount hint.
+func naturalVolumeType(volume kobject.Volumes) string {
+	if volume.Type == "bind" || (volume.Type == "" && volume.Host != "") {
+		return "hostPath"
+	}
+	return "persistentVolumeClaim"
+}
+
+// validVolumeAccessModes are the values accepted by the kompose.volume.access-mode label.
+var validVolumeAccessModes = map[string]bool{"rwo": true, "rox": true, "rwx": true, "rwop": true}
+
+// resolveAccessMode determines the PVC access mode for a volume. The
+// kompose.volume.access-mode label on the root-level volume wins and must be
+// valid; without it the legacy behavior is kept, where a ":ro" suffix also
+// turns the whole PVC ReadOnlyMany (with a warning, since ":ro" in compose
+// only means a read-only mount inside the container).
+func resolveAccessMode(volume kobject.Volumes, serviceName string) (string, error) {
+	if volume.AccessMode != "" {
+		mode := strings.ToLower(strings.TrimSpace(volume.AccessMode))
+		if !validVolumeAccessModes[mode] {
+			return "", fmt.Errorf("invalid access mode %q specified in label 'kompose.volume.access-mode' for volume %s in service %s: must be one of rwo, rox, rwx, rwop", volume.AccessMode, volume.VolumeName, serviceName)
+		}
+		return mode, nil
+	}
+	if volume.Mode == "ro" || volume.Mode == "rox" {
+		log.Warnf("Volume %s in service %s is mounted read-only: the PVC access mode is set to ReadOnlyMany for compatibility, which many storage classes cannot bind. Use the kompose.volume.access-mode label on the root-level volume to set the access mode explicitly", volume.VolumeName, serviceName)
+	}
+	return volume.Mode, nil
 }
 
 // ConfigEmptyVolumeSource is helper function to create an EmptyDir api.VolumeSource
@@ -1725,7 +1869,10 @@ func (k *Kubernetes) Transform(komposeObject kobject.KomposeObject, opt kobject.
 
 	// sort all object so Services are first
 	k.SortServicesFirst(&allobjects)
+	// merge duplicate PVCs generated for shared named volumes before deduping
+	k.MergeSharedPVCs(&allobjects)
 	k.RemoveDupObjects(&allobjects)
+	k.SortPVCsByName(&allobjects)
 
 	// Only append namespaces if --namespace has been passed in
 	if komposeObject.Namespace != "" {

@@ -952,6 +952,87 @@ func (k *Kubernetes) RemoveDupObjects(objs *[]runtime.Object) {
 	*objs = result
 }
 
+// MergeSharedPVCs merges duplicate PersistentVolumeClaim objects that several
+// services generate for the same shared named volume. The first occurrence is
+// kept (RemoveDupObjects drops the rest); its access modes are the union of
+// all claims: a single read-write claim makes the merged PVC read-write, while
+// conflicting writable modes (e.g. rwx vs rwo) conservatively stay
+// ReadWriteOnce with a warning.
+func (k *Kubernetes) MergeSharedPVCs(objs *[]runtime.Object) {
+	byName := map[string][]*api.PersistentVolumeClaim{}
+	var order []string
+	for _, obj := range *objs {
+		pvc, ok := obj.(*api.PersistentVolumeClaim)
+		if !ok {
+			continue
+		}
+		if _, seen := byName[pvc.Name]; !seen {
+			order = append(order, pvc.Name)
+		}
+		byName[pvc.Name] = append(byName[pvc.Name], pvc)
+	}
+	for _, name := range order {
+		pvcs := byName[name]
+		if len(pvcs) < 2 {
+			continue
+		}
+		merged := mergeAccessModes(name, pvcs)
+		pvcs[0].Spec.AccessModes = merged
+	}
+}
+
+// mergeAccessModes computes the union of the access modes of duplicate claims:
+// identical modes are kept as-is; any disagreement results in ReadWriteOnce so
+// that a service needing read-write access is never blocked by another
+// service's read-only claim, without silently upgrading to ReadWriteMany.
+func mergeAccessModes(name string, pvcs []*api.PersistentVolumeClaim) []api.PersistentVolumeAccessMode {
+	first := pvcs[0].Spec.AccessModes
+	conflict := false
+	for _, pvc := range pvcs[1:] {
+		if !accessModesEqual(first, pvc.Spec.AccessModes) {
+			conflict = true
+			break
+		}
+	}
+	if !conflict {
+		return first
+	}
+	log.Warnf("Volume %s is shared by multiple services with different access modes: the PVC is generated as ReadWriteOnce (read-write union). Set kompose.volume.access-mode on the root-level volume to choose explicitly", name)
+	return []api.PersistentVolumeAccessMode{api.ReadWriteOnce}
+}
+
+func accessModesEqual(a, b []api.PersistentVolumeAccessMode) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// SortPVCsByName sorts the PersistentVolumeClaim objects among themselves (in
+// their current slots) so repeated conversions of the same input produce
+// byte-identical output with PVCs ordered by name.
+func (k *Kubernetes) SortPVCsByName(objs *[]runtime.Object) {
+	var pvcs []*api.PersistentVolumeClaim
+	for _, obj := range *objs {
+		if pvc, ok := obj.(*api.PersistentVolumeClaim); ok {
+			pvcs = append(pvcs, pvc)
+		}
+	}
+	sort.Slice(pvcs, func(i, j int) bool { return pvcs[i].Name < pvcs[j].Name })
+	idx := 0
+	for i, obj := range *objs {
+		if _, ok := obj.(*api.PersistentVolumeClaim); ok {
+			(*objs)[i] = pvcs[idx]
+			idx++
+		}
+	}
+}
+
 // SortedKeys Ensure the kubernetes objects are in a consistent order
 func SortedKeys[V kobject.ServiceConfig | kobject.ServiceConfigGroup](serviceConfig map[string]V) []string {
 	var sortedKeys []string
